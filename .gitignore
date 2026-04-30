@@ -1,0 +1,13 @@
+.env
+credentials.json
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+CONVERSATION.txt
+*.yaml
+swagwe_api_wb/
