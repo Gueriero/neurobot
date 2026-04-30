@@ -18,7 +18,7 @@ COPY credentials.json .
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-RUN echo "0 6 * * * cd /app && /usr/local/bin/python src/main.py --once >> /var/log/wb_tracker.log 2>&1" > /etc/cron.d/wb-tracker \
+RUN echo "0 1 * * * cd /app && /usr/local/bin/python src/main.py --once >> /var/log/wb_tracker.log 2>&1" > /etc/cron.d/wb-tracker \
     && chmod 0644 /etc/cron.d/wb-tracker \
     && crontab /etc/cron.d/wb-tracker \
     && touch /var/log/wb_tracker.log

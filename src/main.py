@@ -153,9 +153,9 @@ def run_scheduler():
     import time
 
     # Schedule for 06:00 Moscow time
-    schedule.every().day.at("06:00").do(run_collection)
+    schedule.every().day.at("01:00").do(run_collection)
 
-    print("Scheduler started. Running at 06:00 daily.")
+    print("Scheduler started. Running at 01:00 daily.")
     print("Press Ctrl+C to stop.")
 
     while True:

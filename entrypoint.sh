@@ -11,7 +11,7 @@ python src/main.py --init-db
 # Start cron in background
 cron
 
-echo "=== WB Tracker started. Cron scheduled at 06:00 MSK ==="
+echo "=== WB Tracker started. Cron scheduled at 01:00 MSK ==="
 echo "=== Tailing log... ==="
 
 # Keep container alive and show logs
