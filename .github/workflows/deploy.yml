@@ -15,28 +15,27 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: 22
+          envs: GH_TOKEN,ENV_FILE,GOOGLE_CREDENTIALS_JSON
           script: |
             set -e
             DEPLOY_DIR="/opt/neurobot"
 
             # First deploy: clone. Next deploys: pull.
             if [ ! -d "$DEPLOY_DIR/.git" ]; then
-              git clone https://${{ secrets.GH_TOKEN }}@github.com/Gueriero/neurobot.git "$DEPLOY_DIR"
+              git clone "https://${GH_TOKEN}@github.com/Gueriero/neurobot.git" "$DEPLOY_DIR"
             else
               cd "$DEPLOY_DIR"
+              git remote set-url origin "https://${GH_TOKEN}@github.com/Gueriero/neurobot.git"
               git pull origin main
             fi
 
             cd "$DEPLOY_DIR"
 
             # Write .env from secret
-            cat > .env << 'ENVEOF'
-            ${{ secrets.ENV_FILE }}
-            ENVEOF
-            sed -i 's/^            //' .env
+            printf '%s\n' "$ENV_FILE" > .env
 
             # Write Google credentials from secret
-            echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
+            printf '%s\n' "$GOOGLE_CREDENTIALS_JSON" > credentials.json
 
             # Install Docker if missing
             if ! command -v docker &> /dev/null; then
@@ -49,3 +48,7 @@ jobs:
 
             echo "=== Deploy complete ==="
             docker compose ps
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
