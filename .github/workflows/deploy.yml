@@ -20,6 +20,9 @@ jobs:
             set -e
             DEPLOY_DIR="/opt/neurobot"
 
+            # Strip newlines from token
+            GH_TOKEN=$(echo "$GH_TOKEN" | tr -d '\n\r')
+
             # First deploy: clone. Next deploys: pull.
             if [ ! -d "$DEPLOY_DIR/.git" ]; then
               git clone "https://${GH_TOKEN}@github.com/Gueriero/neurobot.git" "$DEPLOY_DIR"
