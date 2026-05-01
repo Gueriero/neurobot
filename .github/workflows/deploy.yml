@@ -47,7 +47,9 @@ jobs:
 
             # Install Docker Compose plugin if missing
             if ! docker compose version &> /dev/null; then
-              apt-get update && apt-get install -y docker-compose-plugin
+              mkdir -p /usr/local/lib/docker/cli-plugins
+              curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+              chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
             fi
 
             # Rebuild and restart
