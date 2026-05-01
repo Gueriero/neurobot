@@ -45,6 +45,11 @@ jobs:
               curl -fsSL https://get.docker.com | sh
             fi
 
+            # Install Docker Compose plugin if missing
+            if ! docker compose version &> /dev/null; then
+              apt-get update && apt-get install -y docker-compose-plugin
+            fi
+
             # Rebuild and restart
             docker compose down 2>/dev/null || true
             docker compose up -d --build
