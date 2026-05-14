@@ -12,6 +12,9 @@ from config import (
     SHEET_COMBINED,
 )
 
+META_COLS = 6
+SUMMARY_ROWS = 4
+
 
 class GoogleSheetsService:
     """Service for working with Google Sheets."""
@@ -649,3 +652,25 @@ def build_stocks_data_for_sheets(stocks_records: list) -> dict:
                 'in_way_from': iwf
             }
     return result
+
+
+def aggregate_stock_totals(stocks_data: dict) -> dict:
+    """Sum quantity + in_way_to + in_way_from per (ip, str(nm_id)) across all warehouses."""
+    totals = {}
+    for (ip, nm_id, _title, _warehouse), info in stocks_data.items():
+        key = (ip, str(nm_id))
+        total = (
+            (info.get('quantity', 0) or 0)
+            + (info.get('in_way_to', 0) or 0)
+            + (info.get('in_way_from', 0) or 0)
+        )
+        totals[key] = totals.get(key, 0) + total
+    return totals
+
+
+def _date_sort_key(d: str):
+    """Sort key for 'DD.MM.YYYY' date-column labels; unparseable labels sort first."""
+    try:
+        return datetime.strptime(d, '%d.%m.%Y')
+    except ValueError:
+        return datetime.min
