@@ -623,6 +623,209 @@ class GoogleSheetsService:
 
         print(f"    Combined sheet: {len(sorted_keys)} rows, {len(groups)} groups")
 
+    def update_combined_sheet_bulk(self, orders_by_date: dict):
+        """
+        Bulk-merge multiple historical order date-columns in ONE read/write cycle.
+        orders_by_date: {"DD.MM.YYYY": {(ip, nm_id, title): orders_count}}.
+        Orders-only: existing warehouse stock cells and column F 'Остаток' are
+        preserved unchanged. Date columns are re-sorted chronologically after merge.
+        Auto-migrates an old 5-meta-column sheet to the 6-column layout.
+        """
+        ws = self.get_worksheet(SHEET_COMBINED)
+        all_data = self._safe_call(ws.get_all_values)
+
+        if all_data and len(all_data) > SUMMARY_ROWS:
+            headers = all_data[SUMMARY_ROWS]
+            read_meta = 6 if (len(headers) > 5 and headers[5].strip() == 'Остаток') else 5
+            existing_rows = all_data[SUMMARY_ROWS + 1:]
+            orig_date_columns = [d.strip().lstrip("'") for d in headers[read_meta:]]
+        else:
+            read_meta = META_COLS
+            existing_rows = []
+            orig_date_columns = []
+
+        date_columns = list(orig_date_columns)
+        for date in orders_by_date:
+            if date not in date_columns:
+                date_columns.append(date)
+        date_columns = sorted(date_columns, key=_date_sort_key)
+
+        rows_map = {}
+        for row in existing_rows:
+            if len(row) < 2 or not row[0] or not row[1]:
+                continue
+            ip, nm_id = row[0], row[1]
+            title = row[2] if len(row) > 2 else ''
+            mp = row[3] if len(row) > 3 else 'WB'
+            warehouse = row[4] if len(row) > 4 else ''
+            ostatok = row[5] if (read_meta == 6 and len(row) > 5) else ''
+            key = (ip, nm_id, warehouse)
+            date_values = row[read_meta:] if len(row) > read_meta else []
+            rows_map[key] = {
+                'meta': [ip, nm_id, title, mp, warehouse],
+                'ostatok': ostatok,
+                'dates': {orig_date_columns[i]: date_values[i] if i < len(date_values) else ''
+                          for i in range(len(orig_date_columns))},
+            }
+
+        for date, orders in orders_by_date.items():
+            for (ip, nm_id, title), orders_count in orders.items():
+                key = (ip, str(nm_id), '')
+                if key in rows_map:
+                    rows_map[key]['dates'][date] = orders_count
+                    if title:
+                        rows_map[key]['meta'][2] = title
+                else:
+                    rows_map[key] = {
+                        'meta': [ip, str(nm_id), title or '', 'WB', ''],
+                        'ostatok': '',
+                        'dates': {},
+                    }
+                    rows_map[key]['dates'][date] = orders_count
+
+        sorted_keys = sorted(rows_map.keys(), key=lambda k: (k[0], str(k[1]), k[2]))
+
+        day_names = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+        row_dow = ['', '', '', '', '', '']
+        row_stocks_total = ['', '', '', '', 'Остатки', '']
+        row_orders_total = ['', '', '', '', 'Заказы', '']
+        row_days_to_sell = ['', '', '', '', 'Дней', '']
+
+        for d in date_columns:
+            try:
+                dt = datetime.strptime(d, '%d.%m.%Y')
+                row_dow.append(day_names[dt.weekday()])
+            except ValueError:
+                row_dow.append('')
+
+            total_orders = 0
+            total_stocks = 0
+            for key, row_data in rows_map.items():
+                val = row_data['dates'].get(d, '') or 0
+                try:
+                    val = int(val)
+                except (ValueError, TypeError):
+                    val = 0
+                if not key[2]:
+                    total_orders += val
+                else:
+                    total_stocks += val
+
+            row_stocks_total.append(total_stocks)
+            row_orders_total.append(total_orders)
+            if total_orders > 0:
+                row_days_to_sell.append(round(total_stocks / total_orders * 2))
+            else:
+                row_days_to_sell.append('')
+
+        new_headers = ['ИП', 'Артикул', 'Наименование', 'МП', 'Склад', 'Остаток'] + ["'" + d for d in date_columns]
+        output_rows = [row_days_to_sell, row_orders_total, row_stocks_total, row_dow, new_headers]
+        for key in sorted_keys:
+            row_data = rows_map[key]
+            meta = row_data['meta']
+            ostatok = row_data.get('ostatok', '')
+            dates = [row_data['dates'].get(d, '') or 0 for d in date_columns]
+            output_rows.append(meta + [ostatok] + dates)
+
+        self._remove_all_row_groups(ws)
+        time.sleep(1)
+
+        try:
+            self._safe_call(self.spreadsheet.batch_update, {"requests": [
+                {"clearBasicFilter": {"sheetId": ws.id}}
+            ]})
+            time.sleep(1)
+        except Exception:
+            pass
+
+        self._safe_call(ws.clear)
+        time.sleep(1)
+
+        self._safe_call(self.spreadsheet.batch_update, {"requests": [
+            {
+                "repeatCell": {
+                    "range": {"sheetId": ws.id},
+                    "fields": "userEnteredFormat.numberFormat"
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {"sheetId": ws.id},
+                    "fields": "note"
+                }
+            }
+        ]})
+        time.sleep(1)
+
+        self._safe_call(ws.update, 'A1', output_rows, value_input_option='USER_ENTERED')
+        time.sleep(1)
+
+        groups = []
+        current_article = None
+        group_start = None
+
+        for i, key in enumerate(sorted_keys):
+            article_key = (key[0], key[1])
+            if article_key != current_article:
+                if current_article is not None and i - group_start > 1:
+                    groups.append({
+                        'start': SUMMARY_ROWS + 1 + group_start + 1,
+                        'end': SUMMARY_ROWS + 1 + i
+                    })
+                current_article = article_key
+                group_start = i
+        if current_article is not None and len(sorted_keys) - group_start > 1:
+            groups.append({
+                'start': SUMMARY_ROWS + 1 + group_start + 1,
+                'end': SUMMARY_ROWS + 1 + len(sorted_keys)
+            })
+
+        requests = []
+
+        total_cols = META_COLS + len(date_columns)
+        requests.append({
+            "setBasicFilter": {
+                "filter": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": SUMMARY_ROWS,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": total_cols
+                    }
+                }
+            }
+        })
+
+        for g in groups:
+            requests.append({
+                "addDimensionGroup": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "ROWS",
+                        "startIndex": g['start'],
+                        "endIndex": g['end']
+                    }
+                }
+            })
+        for g in groups:
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "ROWS",
+                        "startIndex": g['start'],
+                        "endIndex": g['end']
+                    },
+                    "properties": {"hiddenByUser": True},
+                    "fields": "hiddenByUser"
+                }
+            })
+
+        self._safe_call(self.spreadsheet.batch_update, {"requests": requests})
+
+        print(f"    Combined sheet (bulk): {len(sorted_keys)} rows, "
+              f"{len(date_columns)} date columns, {len(groups)} groups")
+
 
 def format_date_for_sheets(date_str: str) -> str:
     """Format date for Google Sheets column header."""
