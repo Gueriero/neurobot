@@ -655,7 +655,11 @@ def build_stocks_data_for_sheets(stocks_records: list) -> dict:
 
 
 def aggregate_stock_totals(stocks_data: dict) -> dict:
-    """Sum quantity + in_way_to + in_way_from per (ip, str(nm_id)) across all warehouses."""
+    """Sum quantity + in_way_to + in_way_from per (ip, str(nm_id)) across all warehouses.
+
+    Expects stocks_data keyed by 4-tuples (ip, nm_id, title, warehouse) — the shape
+    built in main.py, NOT the 3-tuple shape from build_stocks_data_for_sheets.
+    """
     totals = {}
     for (ip, nm_id, _title, _warehouse), info in stocks_data.items():
         key = (ip, str(nm_id))
