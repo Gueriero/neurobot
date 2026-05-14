@@ -349,24 +349,24 @@ class GoogleSheetsService:
         """
         Update combined orders+stocks sheet with row grouping.
         Orders rows = empty warehouse. Stock rows = with warehouse, grouped under orders row.
-        Rows 1-4: summary (day of week, total stocks, total orders, days to sell).
-        Row 5: headers with auto-filter.
+        Rows 1-4: summary. Row 5: headers with auto-filter.
+        Column F 'Остаток' = total stock per article on the orders row, blank on warehouse rows.
+        Auto-migrates an old 5-meta-column sheet to the 6-column layout on first run.
         """
-        META_COLS = 5
-        SUMMARY_ROWS = 4
         ws = self.get_worksheet(SHEET_COMBINED)
-
         all_data = self._safe_call(ws.get_all_values)
 
         if all_data and len(all_data) > SUMMARY_ROWS:
             headers = all_data[SUMMARY_ROWS]
+            read_meta = 6 if (len(headers) > 5 and headers[5].strip() == 'Остаток') else 5
             existing_rows = all_data[SUMMARY_ROWS + 1:]
-            date_columns = [d.strip() for d in headers[META_COLS:]]
+            orig_date_columns = [d.strip().lstrip("'") for d in headers[read_meta:]]
         else:
-            headers = ['ИП', 'Артикул', 'Наименование', 'МП', 'Склад']
+            read_meta = META_COLS
             existing_rows = []
-            date_columns = []
+            orig_date_columns = []
 
+        date_columns = list(orig_date_columns)
         if date not in date_columns:
             date_columns.append(date)
 
@@ -378,12 +378,14 @@ class GoogleSheetsService:
             title = row[2] if len(row) > 2 else ''
             mp = row[3] if len(row) > 3 else 'WB'
             warehouse = row[4] if len(row) > 4 else ''
+            ostatok = row[5] if (read_meta == 6 and len(row) > 5) else ''
             key = (ip, nm_id, warehouse)
-            date_values = row[META_COLS:] if len(row) > META_COLS else []
+            date_values = row[read_meta:] if len(row) > read_meta else []
             rows_map[key] = {
                 'meta': [ip, nm_id, title, mp, warehouse],
-                'dates': {date_columns[i]: date_values[i] if i < len(date_values) else ''
-                          for i in range(len(date_columns))},
+                'ostatok': ostatok,
+                'dates': {orig_date_columns[i]: date_values[i] if i < len(date_values) else ''
+                          for i in range(len(orig_date_columns))},
                 'in_way': {}
             }
 
@@ -396,6 +398,7 @@ class GoogleSheetsService:
             else:
                 rows_map[key] = {
                     'meta': [ip, str(nm_id), title or '', 'WB', ''],
+                    'ostatok': '',
                     'dates': {d: '' for d in date_columns},
                     'in_way': {}
                 }
@@ -414,6 +417,7 @@ class GoogleSheetsService:
             else:
                 rows_map[key] = {
                     'meta': [ip, str(nm_id), title or '', 'WB', warehouse],
+                    'ostatok': '',
                     'dates': {d: '' for d in date_columns},
                     'in_way': {}
                 }
@@ -424,6 +428,7 @@ class GoogleSheetsService:
             if orders_key not in rows_map:
                 rows_map[orders_key] = {
                     'meta': [ip, str(nm_id), title or '', 'WB', ''],
+                    'ostatok': '',
                     'dates': {d: '' for d in date_columns},
                     'in_way': {}
                 }
@@ -448,13 +453,14 @@ class GoogleSheetsService:
             if stale_keys:
                 print(f"    Removed {len(stale_keys)} stale warehouse rows (no stock in {cutoff_days}+ days)")
 
+        stock_totals = aggregate_stock_totals(stocks_data)
         sorted_keys = sorted(rows_map.keys(), key=lambda k: (k[0], str(k[1]), k[2]))
 
         day_names = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
-        row_dow = ['', '', '', '', '']
-        row_stocks_total = ['', '', '', '', 'Остатки']
-        row_orders_total = ['', '', '', '', 'Заказы']
-        row_days_to_sell = ['', '', '', '', 'Дней']
+        row_dow = ['', '', '', '', '', '']
+        row_stocks_total = ['', '', '', '', 'Остатки', '']
+        row_orders_total = ['', '', '', '', 'Заказы', '']
+        row_days_to_sell = ['', '', '', '', 'Дней', '']
 
         for d in date_columns:
             try:
@@ -483,13 +489,17 @@ class GoogleSheetsService:
             else:
                 row_days_to_sell.append('')
 
-        new_headers = ['ИП', 'Артикул', 'Наименование', 'МП', 'Склад'] + ["'" + d for d in date_columns]
+        new_headers = ['ИП', 'Артикул', 'Наименование', 'МП', 'Склад', 'Остаток'] + ["'" + d for d in date_columns]
         output_rows = [row_days_to_sell, row_orders_total, row_stocks_total, row_dow, new_headers]
         for key in sorted_keys:
             row_data = rows_map[key]
             meta = row_data['meta']
+            if key[2]:
+                ostatok = ''
+            else:
+                ostatok = stock_totals.get((key[0], str(key[1])), '')
             dates = [row_data['dates'].get(d, '') or 0 for d in date_columns]
-            output_rows.append(meta + dates)
+            output_rows.append(meta + [ostatok] + dates)
 
         self._remove_all_row_groups(ws)
         time.sleep(1)
