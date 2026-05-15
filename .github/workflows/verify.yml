@@ -11,6 +11,7 @@ on:
           - dry-run
           - daily-once
           - backfill-3
+          - backfill-30
 
 jobs:
   verify:
@@ -36,6 +37,9 @@ jobs:
                 ;;
               backfill-3)
                 docker compose exec -T app python src/backfill_orders.py --days 3
+                ;;
+              backfill-30)
+                docker compose exec -T app python src/backfill_orders.py --days 30
                 ;;
               *)
                 echo "Unknown step: ${{ inputs.step }}"
