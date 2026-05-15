@@ -1,0 +1,44 @@
+name: Verify on VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: 'Which verification step to run'
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - daily-once
+          - backfill-3
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run step via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          command_timeout: 60m
+          script: |
+            set -e
+            cd /opt/neurobot
+            case "${{ inputs.step }}" in
+              dry-run)
+                docker compose exec -T app python src/backfill_orders.py --dry-run --days 30
+                ;;
+              daily-once)
+                docker compose exec -T app python src/main.py --once
+                ;;
+              backfill-3)
+                docker compose exec -T app python src/backfill_orders.py --days 3
+                ;;
+              *)
+                echo "Unknown step: ${{ inputs.step }}"
+                exit 1
+                ;;
+            esac
