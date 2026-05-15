@@ -316,41 +316,65 @@ class GoogleSheetsService:
             }]
         })
 
-    def _remove_all_row_groups(self, ws):
-        """Remove all existing row groups and unhide all rows."""
+    def _remove_all_dimension_groups(self, ws):
+        """Remove all existing row and column groups, and unhide all rows and columns."""
         try:
             meta = self.spreadsheet.fetch_sheet_metadata()
         except Exception:
             return
         for sheet in meta.get('sheets', []):
             if sheet['properties']['sheetId'] == ws.id:
-                row_count = sheet['properties']['gridProperties']['rowCount']
+                grid = sheet['properties']['gridProperties']
+                row_count = grid.get('rowCount', 0)
+                col_count = grid.get('columnCount', 0)
                 row_groups = sheet.get('rowGroups', [])
+                column_groups = sheet.get('columnGroups', [])
                 requests = []
                 if row_groups:
                     row_groups.sort(key=lambda g: g.get('depth', 0), reverse=True)
                     requests.extend([{"deleteDimensionGroup": {"range": g['range']}} for g in row_groups])
-                requests.append({
-                    "updateDimensionProperties": {
-                        "range": {
-                            "sheetId": ws.id,
-                            "dimension": "ROWS",
-                            "startIndex": 1,
-                            "endIndex": row_count
-                        },
-                        "properties": {"hiddenByUser": False},
-                        "fields": "hiddenByUser"
-                    }
-                })
-                self._safe_call(self.spreadsheet.batch_update, {"requests": requests})
+                if column_groups:
+                    column_groups.sort(key=lambda g: g.get('depth', 0), reverse=True)
+                    requests.extend([{"deleteDimensionGroup": {"range": g['range']}} for g in column_groups])
+                if row_count > 1:
+                    requests.append({
+                        "updateDimensionProperties": {
+                            "range": {
+                                "sheetId": ws.id,
+                                "dimension": "ROWS",
+                                "startIndex": 1,
+                                "endIndex": row_count,
+                            },
+                            "properties": {"hiddenByUser": False},
+                            "fields": "hiddenByUser",
+                        }
+                    })
+                if col_count > 0:
+                    requests.append({
+                        "updateDimensionProperties": {
+                            "range": {
+                                "sheetId": ws.id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 0,
+                                "endIndex": col_count,
+                            },
+                            "properties": {"hiddenByUser": False},
+                            "fields": "hiddenByUser",
+                        }
+                    })
+                if requests:
+                    self._safe_call(self.spreadsheet.batch_update, {"requests": requests})
                 return
 
     def update_combined_sheet(self, orders_data: dict, stocks_data: dict, date: str):
         """
-        Update combined orders+stocks sheet with row grouping.
+        Update combined orders+stocks sheet with row grouping and month-summary columns.
         Orders rows = empty warehouse. Stock rows = with warehouse, grouped under orders row.
         Rows 1-4: summary. Row 5: headers with auto-filter.
         Column F 'Остаток' = total stock per article on the orders row, blank on warehouse rows.
+        Completed months (any later-month date present) get a summary column after their
+        last date and a collapsed column-group over their date columns; the summary column
+        stays outside the group so its averages remain visible when collapsed.
         Auto-migrates an old 5-meta-column sheet to the 6-column layout on first run.
         """
         ws = self.get_worksheet(SHEET_COMBINED)
@@ -360,15 +384,16 @@ class GoogleSheetsService:
             headers = all_data[SUMMARY_ROWS]
             read_meta = 6 if (len(headers) > 5 and headers[5].strip() == 'Остаток') else 5
             existing_rows = all_data[SUMMARY_ROWS + 1:]
-            orig_date_columns = [d.strip().lstrip("'") for d in headers[read_meta:]]
+            orig_columns = [d.strip().lstrip("'") for d in headers[read_meta:]]
         else:
             read_meta = META_COLS
             existing_rows = []
-            orig_date_columns = []
+            orig_columns = []
 
-        date_columns = list(orig_date_columns)
+        date_columns = [d for d in orig_columns if _is_parseable_date(d)]
         if date not in date_columns:
             date_columns.append(date)
+        date_columns = sorted(date_columns, key=_date_sort_key)
 
         rows_map = {}
         for row in existing_rows:
@@ -381,11 +406,14 @@ class GoogleSheetsService:
             ostatok = row[5] if (read_meta == 6 and len(row) > 5) else ''
             key = (ip, nm_id, warehouse)
             date_values = row[read_meta:] if len(row) > read_meta else []
+            dates_dict = {}
+            for i, lbl in enumerate(orig_columns):
+                if _is_parseable_date(lbl) and i < len(date_values):
+                    dates_dict[lbl] = date_values[i]
             rows_map[key] = {
                 'meta': [ip, nm_id, title, mp, warehouse],
                 'ostatok': ostatok,
-                'dates': {orig_date_columns[i]: date_values[i] if i < len(date_values) else ''
-                          for i in range(len(orig_date_columns))},
+                'dates': dates_dict,
                 'in_way': {}
             }
 
@@ -456,21 +484,13 @@ class GoogleSheetsService:
         stock_totals = aggregate_stock_totals(stocks_data)
         sorted_keys = sorted(rows_map.keys(), key=lambda k: (k[0], str(k[1]), k[2]))
 
-        day_names = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
-        row_dow = ['', '', '', '', '', '']
-        row_stocks_total = ['', '', '', '', 'Остатки', '']
-        row_orders_total = ['', '', '', '', 'Заказы', '']
-        row_days_to_sell = ['', '', '', '', 'Дней', '']
+        display_columns, month_summary_meta, column_groups = _build_month_layout(date_columns)
 
+        orders_total_by_date = {}
+        stocks_total_by_date = {}
         for d in date_columns:
-            try:
-                dt = datetime.strptime(d, '%d.%m.%Y')
-                row_dow.append(day_names[dt.weekday()])
-            except ValueError:
-                row_dow.append('')
-
-            total_orders = 0
-            total_stocks = 0
+            t_orders = 0
+            t_stocks = 0
             for key, row_data in rows_map.items():
                 val = row_data['dates'].get(d, '') or 0
                 try:
@@ -478,18 +498,54 @@ class GoogleSheetsService:
                 except (ValueError, TypeError):
                     val = 0
                 if not key[2]:
-                    total_orders += val
+                    t_orders += val
                 else:
-                    total_stocks += val
+                    t_stocks += val
+            orders_total_by_date[d] = t_orders
+            stocks_total_by_date[d] = t_stocks
 
-            row_stocks_total.append(total_stocks)
-            row_orders_total.append(total_orders)
-            if total_orders > 0:
-                row_days_to_sell.append(round(total_stocks / total_orders * 2))
+        day_names = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+        row_dow = ['', '', '', '', '', '']
+        row_stocks_total = ['', '', '', '', 'Остатки', '']
+        row_orders_total = ['', '', '', '', 'Заказы', '']
+        row_days_to_sell = ['', '', '', '', 'Дней', '']
+
+        for col_label in display_columns:
+            if col_label in month_summary_meta:
+                month_dates = month_summary_meta[col_label]['dates']
+                n = len(month_dates) or 1
+                avg_orders = round(sum(orders_total_by_date.get(d, 0) for d in month_dates) / n)
+                avg_stocks = round(sum(stocks_total_by_date.get(d, 0) for d in month_dates) / n)
+                per_day_days = []
+                for d in month_dates:
+                    o = orders_total_by_date.get(d, 0)
+                    s = stocks_total_by_date.get(d, 0)
+                    if o > 0:
+                        per_day_days.append(s / o * 2)
+                avg_days = round(sum(per_day_days) / len(per_day_days)) if per_day_days else ''
+                row_dow.append(col_label)
+                row_orders_total.append(avg_orders)
+                row_stocks_total.append(avg_stocks)
+                row_days_to_sell.append(avg_days)
             else:
-                row_days_to_sell.append('')
+                try:
+                    dt = datetime.strptime(col_label, '%d.%m.%Y')
+                    row_dow.append(day_names[dt.weekday()])
+                except ValueError:
+                    row_dow.append('')
+                t_orders = orders_total_by_date.get(col_label, 0)
+                t_stocks = stocks_total_by_date.get(col_label, 0)
+                row_orders_total.append(t_orders)
+                row_stocks_total.append(t_stocks)
+                if t_orders > 0:
+                    row_days_to_sell.append(round(t_stocks / t_orders * 2))
+                else:
+                    row_days_to_sell.append('')
 
-        new_headers = ['ИП', 'Артикул', 'Наименование', 'МП', 'Склад', 'Остаток'] + ["'" + d for d in date_columns]
+        new_headers = (
+            ['ИП', 'Артикул', 'Наименование', 'МП', 'Склад', 'Остаток']
+            + [("'" + c) if _is_parseable_date(c) else c for c in display_columns]
+        )
         output_rows = [row_days_to_sell, row_orders_total, row_stocks_total, row_dow, new_headers]
         for key in sorted_keys:
             row_data = rows_map[key]
@@ -498,10 +554,15 @@ class GoogleSheetsService:
                 ostatok = ''
             else:
                 ostatok = stock_totals.get((key[0], str(key[1])), '')
-            dates = [row_data['dates'].get(d, '') or 0 for d in date_columns]
-            output_rows.append(meta + [ostatok] + dates)
+            cells = []
+            for col_label in display_columns:
+                if col_label in month_summary_meta:
+                    cells.append('')
+                else:
+                    cells.append(row_data['dates'].get(col_label, '') or 0)
+            output_rows.append(meta + [ostatok] + cells)
 
-        self._remove_all_row_groups(ws)
+        self._remove_all_dimension_groups(ws)
         time.sleep(1)
 
         try:
@@ -534,7 +595,7 @@ class GoogleSheetsService:
         self._safe_call(ws.update, 'A1', output_rows, value_input_option='USER_ENTERED')
         time.sleep(1)
 
-        groups = []
+        row_groups = []
         current_article = None
         group_start = None
 
@@ -542,21 +603,21 @@ class GoogleSheetsService:
             article_key = (key[0], key[1])
             if article_key != current_article:
                 if current_article is not None and i - group_start > 1:
-                    groups.append({
+                    row_groups.append({
                         'start': SUMMARY_ROWS + 1 + group_start + 1,
                         'end': SUMMARY_ROWS + 1 + i
                     })
                 current_article = article_key
                 group_start = i
         if current_article is not None and len(sorted_keys) - group_start > 1:
-            groups.append({
+            row_groups.append({
                 'start': SUMMARY_ROWS + 1 + group_start + 1,
                 'end': SUMMARY_ROWS + 1 + len(sorted_keys)
             })
 
         requests = []
 
-        total_cols = META_COLS + len(date_columns)
+        total_cols = META_COLS + len(display_columns)
         requests.append({
             "setBasicFilter": {
                 "filter": {
@@ -570,7 +631,7 @@ class GoogleSheetsService:
             }
         })
 
-        for g in groups:
+        for g in row_groups:
             requests.append({
                 "addDimensionGroup": {
                     "range": {
@@ -581,7 +642,7 @@ class GoogleSheetsService:
                     }
                 }
             })
-        for g in groups:
+        for g in row_groups:
             requests.append({
                 "updateDimensionProperties": {
                     "range": {
@@ -595,33 +656,60 @@ class GoogleSheetsService:
                 }
             })
 
-        date_col_api = META_COLS + date_columns.index(date)
-        for i, key in enumerate(sorted_keys):
-            if key[2]:
-                in_way = rows_map[key].get('in_way', {})
-                to_val = in_way.get('to', 0)
-                from_val = in_way.get('from', 0)
-                if to_val or from_val:
-                    row_api = SUMMARY_ROWS + 1 + i
-                    requests.append({
-                        "updateCells": {
-                            "range": {
-                                "sheetId": ws.id,
-                                "startRowIndex": row_api,
-                                "endRowIndex": row_api + 1,
-                                "startColumnIndex": date_col_api,
-                                "endColumnIndex": date_col_api + 1
-                            },
-                            "rows": [{"values": [{
-                                "note": f"В пути к клиенту: {to_val}\nВ пути от клиента: {from_val}"
-                            }]}],
-                            "fields": "note"
-                        }
-                    })
+        for g in column_groups:
+            requests.append({
+                "addDimensionGroup": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": META_COLS + g['start'],
+                        "endIndex": META_COLS + g['end']
+                    }
+                }
+            })
+        for g in column_groups:
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": META_COLS + g['start'],
+                        "endIndex": META_COLS + g['end']
+                    },
+                    "properties": {"hiddenByUser": True},
+                    "fields": "hiddenByUser"
+                }
+            })
+
+        if date in display_columns:
+            date_col_api = META_COLS + display_columns.index(date)
+            for i, key in enumerate(sorted_keys):
+                if key[2]:
+                    in_way = rows_map[key].get('in_way', {})
+                    to_val = in_way.get('to', 0)
+                    from_val = in_way.get('from', 0)
+                    if to_val or from_val:
+                        row_api = SUMMARY_ROWS + 1 + i
+                        requests.append({
+                            "updateCells": {
+                                "range": {
+                                    "sheetId": ws.id,
+                                    "startRowIndex": row_api,
+                                    "endRowIndex": row_api + 1,
+                                    "startColumnIndex": date_col_api,
+                                    "endColumnIndex": date_col_api + 1
+                                },
+                                "rows": [{"values": [{
+                                    "note": f"В пути к клиенту: {to_val}\nВ пути от клиента: {from_val}"
+                                }]}],
+                                "fields": "note"
+                            }
+                        })
 
         self._safe_call(self.spreadsheet.batch_update, {"requests": requests})
 
-        print(f"    Combined sheet: {len(sorted_keys)} rows, {len(groups)} groups")
+        print(f"    Combined sheet: {len(sorted_keys)} rows, "
+              f"{len(row_groups)} row groups, {len(column_groups)} month column groups")
 
     def update_combined_sheet_bulk(self, orders_by_date: dict):
         """
@@ -644,9 +732,9 @@ class GoogleSheetsService:
             existing_rows = []
             orig_date_columns = []
 
-        date_columns = list(orig_date_columns)
+        date_columns = [d for d in orig_date_columns if _is_parseable_date(d)]
         for date in orders_by_date:
-            if date not in date_columns:
+            if date not in date_columns and _is_parseable_date(date):
                 date_columns.append(date)
         date_columns = sorted(date_columns, key=_date_sort_key)
 
@@ -661,11 +749,14 @@ class GoogleSheetsService:
             ostatok = row[5] if (read_meta == 6 and len(row) > 5) else ''
             key = (ip, nm_id, warehouse)
             date_values = row[read_meta:] if len(row) > read_meta else []
+            dates_dict = {}
+            for i, lbl in enumerate(orig_date_columns):
+                if _is_parseable_date(lbl) and i < len(date_values):
+                    dates_dict[lbl] = date_values[i]
             rows_map[key] = {
                 'meta': [ip, nm_id, title, mp, warehouse],
                 'ostatok': ostatok,
-                'dates': {orig_date_columns[i]: date_values[i] if i < len(date_values) else ''
-                          for i in range(len(orig_date_columns))},
+                'dates': dates_dict,
             }
 
         for date, orders in orders_by_date.items():
@@ -685,21 +776,13 @@ class GoogleSheetsService:
 
         sorted_keys = sorted(rows_map.keys(), key=lambda k: (k[0], str(k[1]), k[2]))
 
-        day_names = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
-        row_dow = ['', '', '', '', '', '']
-        row_stocks_total = ['', '', '', '', 'Остатки', '']
-        row_orders_total = ['', '', '', '', 'Заказы', '']
-        row_days_to_sell = ['', '', '', '', 'Дней', '']
+        display_columns, month_summary_meta, column_groups = _build_month_layout(date_columns)
 
+        orders_total_by_date = {}
+        stocks_total_by_date = {}
         for d in date_columns:
-            try:
-                dt = datetime.strptime(d, '%d.%m.%Y')
-                row_dow.append(day_names[dt.weekday()])
-            except ValueError:
-                row_dow.append('')
-
-            total_orders = 0
-            total_stocks = 0
+            t_orders = 0
+            t_stocks = 0
             for key, row_data in rows_map.items():
                 val = row_data['dates'].get(d, '') or 0
                 try:
@@ -707,27 +790,68 @@ class GoogleSheetsService:
                 except (ValueError, TypeError):
                     val = 0
                 if not key[2]:
-                    total_orders += val
+                    t_orders += val
                 else:
-                    total_stocks += val
+                    t_stocks += val
+            orders_total_by_date[d] = t_orders
+            stocks_total_by_date[d] = t_stocks
 
-            row_stocks_total.append(total_stocks)
-            row_orders_total.append(total_orders)
-            if total_orders > 0:
-                row_days_to_sell.append(round(total_stocks / total_orders * 2))
+        day_names = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+        row_dow = ['', '', '', '', '', '']
+        row_stocks_total = ['', '', '', '', 'Остатки', '']
+        row_orders_total = ['', '', '', '', 'Заказы', '']
+        row_days_to_sell = ['', '', '', '', 'Дней', '']
+
+        for col_label in display_columns:
+            if col_label in month_summary_meta:
+                month_dates = month_summary_meta[col_label]['dates']
+                n = len(month_dates) or 1
+                avg_orders = round(sum(orders_total_by_date.get(d, 0) for d in month_dates) / n)
+                avg_stocks = round(sum(stocks_total_by_date.get(d, 0) for d in month_dates) / n)
+                per_day_days = []
+                for d in month_dates:
+                    o = orders_total_by_date.get(d, 0)
+                    s = stocks_total_by_date.get(d, 0)
+                    if o > 0:
+                        per_day_days.append(s / o * 2)
+                avg_days = round(sum(per_day_days) / len(per_day_days)) if per_day_days else ''
+                row_dow.append(col_label)
+                row_orders_total.append(avg_orders)
+                row_stocks_total.append(avg_stocks)
+                row_days_to_sell.append(avg_days)
             else:
-                row_days_to_sell.append('')
+                try:
+                    dt = datetime.strptime(col_label, '%d.%m.%Y')
+                    row_dow.append(day_names[dt.weekday()])
+                except ValueError:
+                    row_dow.append('')
+                t_orders = orders_total_by_date.get(col_label, 0)
+                t_stocks = stocks_total_by_date.get(col_label, 0)
+                row_orders_total.append(t_orders)
+                row_stocks_total.append(t_stocks)
+                if t_orders > 0:
+                    row_days_to_sell.append(round(t_stocks / t_orders * 2))
+                else:
+                    row_days_to_sell.append('')
 
-        new_headers = ['ИП', 'Артикул', 'Наименование', 'МП', 'Склад', 'Остаток'] + ["'" + d for d in date_columns]
+        new_headers = (
+            ['ИП', 'Артикул', 'Наименование', 'МП', 'Склад', 'Остаток']
+            + [("'" + c) if _is_parseable_date(c) else c for c in display_columns]
+        )
         output_rows = [row_days_to_sell, row_orders_total, row_stocks_total, row_dow, new_headers]
         for key in sorted_keys:
             row_data = rows_map[key]
             meta = row_data['meta']
             ostatok = row_data.get('ostatok', '')
-            dates = [row_data['dates'].get(d, '') or 0 for d in date_columns]
-            output_rows.append(meta + [ostatok] + dates)
+            cells = []
+            for col_label in display_columns:
+                if col_label in month_summary_meta:
+                    cells.append('')
+                else:
+                    cells.append(row_data['dates'].get(col_label, '') or 0)
+            output_rows.append(meta + [ostatok] + cells)
 
-        self._remove_all_row_groups(ws)
+        self._remove_all_dimension_groups(ws)
         time.sleep(1)
 
         try:
@@ -760,7 +884,7 @@ class GoogleSheetsService:
         self._safe_call(ws.update, 'A1', output_rows, value_input_option='USER_ENTERED')
         time.sleep(1)
 
-        groups = []
+        row_groups = []
         current_article = None
         group_start = None
 
@@ -768,21 +892,21 @@ class GoogleSheetsService:
             article_key = (key[0], key[1])
             if article_key != current_article:
                 if current_article is not None and i - group_start > 1:
-                    groups.append({
+                    row_groups.append({
                         'start': SUMMARY_ROWS + 1 + group_start + 1,
                         'end': SUMMARY_ROWS + 1 + i
                     })
                 current_article = article_key
                 group_start = i
         if current_article is not None and len(sorted_keys) - group_start > 1:
-            groups.append({
+            row_groups.append({
                 'start': SUMMARY_ROWS + 1 + group_start + 1,
                 'end': SUMMARY_ROWS + 1 + len(sorted_keys)
             })
 
         requests = []
 
-        total_cols = META_COLS + len(date_columns)
+        total_cols = META_COLS + len(display_columns)
         requests.append({
             "setBasicFilter": {
                 "filter": {
@@ -796,7 +920,7 @@ class GoogleSheetsService:
             }
         })
 
-        for g in groups:
+        for g in row_groups:
             requests.append({
                 "addDimensionGroup": {
                     "range": {
@@ -807,7 +931,7 @@ class GoogleSheetsService:
                     }
                 }
             })
-        for g in groups:
+        for g in row_groups:
             requests.append({
                 "updateDimensionProperties": {
                     "range": {
@@ -821,10 +945,36 @@ class GoogleSheetsService:
                 }
             })
 
+        for g in column_groups:
+            requests.append({
+                "addDimensionGroup": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": META_COLS + g['start'],
+                        "endIndex": META_COLS + g['end']
+                    }
+                }
+            })
+        for g in column_groups:
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": META_COLS + g['start'],
+                        "endIndex": META_COLS + g['end']
+                    },
+                    "properties": {"hiddenByUser": True},
+                    "fields": "hiddenByUser"
+                }
+            })
+
         self._safe_call(self.spreadsheet.batch_update, {"requests": requests})
 
         print(f"    Combined sheet (bulk): {len(sorted_keys)} rows, "
-              f"{len(date_columns)} date columns, {len(groups)} groups")
+              f"{len(display_columns)} display columns, "
+              f"{len(row_groups)} row groups, {len(column_groups)} month column groups")
 
 
 def format_date_for_sheets(date_str: str) -> str:
@@ -891,3 +1041,78 @@ def _date_sort_key(d: str):
         return datetime.strptime(d, '%d.%m.%Y')
     except ValueError:
         return datetime.min
+
+
+def _is_parseable_date(label: str) -> bool:
+    """True if `label` is a 'DD.MM.YYYY' date string."""
+    if not label:
+        return False
+    try:
+        datetime.strptime(label, '%d.%m.%Y')
+        return True
+    except ValueError:
+        return False
+
+
+_MONTH_NAMES_RU = [
+    'январь', 'февраль', 'март', 'апрель', 'май', 'июнь',
+    'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь',
+]
+
+
+def _build_month_layout(date_columns):
+    """Plan column layout with month-summary columns and column-groups.
+
+    `date_columns` — chronologically-sorted 'DD.MM.YYYY' labels. Unparseable
+    labels are dropped (treated as stale month-summary leftovers).
+
+    Returns (display_columns, month_summary_meta, column_groups):
+      display_columns: ordered list of column labels (dates + month-summary).
+      month_summary_meta: {label: {'year', 'month', 'dates': [date_labels]}}.
+      column_groups: [{'start', 'end'}] — 0-based offsets within the date area
+                     (META_COLS-relative). One entry per completed month, covering
+                     ONLY its date columns (the summary column stays OUTSIDE).
+
+    A month is "completed" iff at least one date in `date_columns` falls in a
+    chronologically later month. The latest month gets no summary and no group.
+    """
+    parsed = []
+    for d in date_columns:
+        try:
+            parsed.append((datetime.strptime(d, '%d.%m.%Y'), d))
+        except ValueError:
+            continue
+
+    if not parsed:
+        return [], {}, []
+
+    by_month = {}
+    month_order = []
+    for dt, lbl in parsed:
+        ym = (dt.year, dt.month)
+        if ym not in by_month:
+            by_month[ym] = []
+            month_order.append(ym)
+        by_month[ym].append(lbl)
+
+    latest_month = month_order[-1]
+    display_columns = []
+    month_summary_meta = {}
+    column_groups = []
+
+    for ym in month_order:
+        dates_in_month = by_month[ym]
+        start_offset = len(display_columns)
+        display_columns.extend(dates_in_month)
+        end_offset = len(display_columns)
+        if ym != latest_month:
+            summary_label = f"{_MONTH_NAMES_RU[ym[1] - 1]} {ym[0] % 100:02d}"
+            display_columns.append(summary_label)
+            month_summary_meta[summary_label] = {
+                'year': ym[0],
+                'month': ym[1],
+                'dates': list(dates_in_month),
+            }
+            column_groups.append({'start': start_offset, 'end': end_offset})
+
+    return display_columns, month_summary_meta, column_groups
