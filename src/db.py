@@ -282,15 +282,25 @@ def get_orders_for_date(ip: str, date) -> list:
 
 
 def get_stocks_latest(ip: str) -> list:
-    """Get latest stock data for an IP."""
+    """Get latest stock data for an IP.
+
+    Returns only rows from each article's most recent snapshot_date, so the
+    warehouse set is a single consistent snapshot. Using the latest snapshot
+    per (nm_id, warehouse_id) independently would let warehouses that WB has
+    stopped returning linger forever with stale quantity/in_way, inflating
+    totals (column F "Остаток").
+    """
     with get_cursor() as cur:
         cur.execute("""
-            SELECT DISTINCT ON (nm_id, warehouse_id)
-                ip, nm_id, chrt_id, warehouse_id, warehouse_name,
-                region_name, quantity, in_way_to_client, in_way_from_client
-            FROM stocks_raw
-            WHERE ip = %s
-            ORDER BY nm_id, warehouse_id, snapshot_date DESC
+            SELECT s.ip, s.nm_id, s.chrt_id, s.warehouse_id, s.warehouse_name,
+                   s.region_name, s.quantity, s.in_way_to_client, s.in_way_from_client
+            FROM stocks_raw s
+            WHERE s.ip = %s
+              AND s.snapshot_date = (
+                  SELECT MAX(s2.snapshot_date)
+                  FROM stocks_raw s2
+                  WHERE s2.ip = s.ip AND s2.nm_id = s.nm_id
+              )
         """, (ip,))
         return cur.fetchall()
 
